@@ -3,6 +3,7 @@
 #include "core/fiber.h"
 
 #include "dist.h"
+#include "eama_solver.h"
 #include "route.h"
 
 #define DEBUG_ASSERT_NEAR(lhs, rhs) assert(fabs((lhs)-(rhs)) < 1e-5)
@@ -53,6 +54,7 @@ feasible_ejections_f(va_list ap)
 
 	int64_t p_sum = 0;
 	int k = 0;
+	uint64_t iterations = 0;
 
 	/** Will be initialized after incr_k */
 	struct customer *e_last;
@@ -63,6 +65,8 @@ feasible_ejections_f(va_list ap)
 	bool incremented_last = false;
 	goto incr_k;
 	for(;;) {
+		if ((iterations++ & 63ULL) == 0 && eama_solver_deadline_reached())
+			return 0;
 		if (/** Is better than current optimum */
 		    p_sum < *p_best &&
 		    /** Doesn't violate time-window constraint */
