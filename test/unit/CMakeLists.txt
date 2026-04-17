@@ -37,6 +37,7 @@ set(common_sources
         ${PROJECT_SOURCE_DIR}/src/problem.c
         ${PROJECT_SOURCE_DIR}/src/route.c
         ${PROJECT_SOURCE_DIR}/src/tw_penalty.c
+        eama_solver_stub.c
         generators.c
 )
 

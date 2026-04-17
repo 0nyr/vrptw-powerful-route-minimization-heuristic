@@ -24,3 +24,17 @@ if(POLICY CMP0037)
 endif(POLICY CMP0037)
 
 add_subdirectory(unit)
+
+set(SOLVER_TIMEOUT_FIXTURE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/c101_n25.txt)
+set(SOLVER_TIMEOUT_OUTPUT
+    ${CMAKE_CURRENT_BINARY_DIR}/solver_timeout.solution)
+add_test(
+    NAME solver_timeout_smoke
+    COMMAND ${CMAKE_COMMAND}
+            -DROUTES_BIN=$<TARGET_FILE:routes>
+            -DFIXTURE=${SOLVER_TIMEOUT_FIXTURE}
+            -DOUTPUT=${SOLVER_TIMEOUT_OUTPUT}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/solver_timeout_smoke.cmake
+)
+set_tests_properties(solver_timeout_smoke PROPERTIES TIMEOUT 3)

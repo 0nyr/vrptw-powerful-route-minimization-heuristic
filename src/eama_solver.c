@@ -102,36 +102,59 @@ squeeze(struct solution *s)
 			//debug_print(tt_sprintf("c_penalty_sum: %f",
 			//					   solution_penalty(s, 1., 0.)), RESET);
 		}
-		int route_idx = randint(0, n_infeasibles - 1);
-		struct route *v_route = infeasibles[route_idx];
-		assert(!route_feasible(v_route));
+			int route_idx = randint(0, n_infeasibles - 1);
+			struct route *v_route = infeasibles[route_idx];
+			assert(!route_feasible(v_route));
 
-		double v_route_penalty = route_penalty(v_route, eama_solver.alpha, eama_solver.beta);
-		struct modification opt_modification = modification_new(INSERT, NULL, NULL);
-		double opt_delta = INFINITY;
-		struct modification m;
-		struct fiber *f = fiber_new(solution_modification_neighbourhood_f);
-		fiber_start(f, s, v_route, options.n_near, &m);
-		while (!fiber_is_dead(f)) {
-			double delta = modification_delta(m, eama_solver.alpha, eama_solver.beta);
-			if (delta < opt_delta) {
-				opt_modification = m;
-				opt_delta = delta;
-				if (opt_delta <= -v_route_penalty + EPS5)
+			double v_route_penalty = route_penalty(v_route, eama_solver.alpha, eama_solver.beta);
+			struct modification opt_modification = modification_new(INSERT, NULL, NULL);
+			double opt_delta = INFINITY;
+			struct modification m;
+			struct fiber *f = fiber_new(solution_modification_neighbourhood_f);
+			bool timed_out = false;
+			fiber_start(f, s, v_route, options.n_near, &m);
+			while (!fiber_is_dead(f)) {
+				if (eama_solver_deadline_reached()) {
+					timed_out = true;
 					fiber_cancel(f);
+					break;
+				}
+				double delta = modification_delta(m, eama_solver.alpha, eama_solver.beta);
+				if (delta < opt_delta) {
+					opt_modification = m;
+					opt_delta = delta;
+					if (opt_delta <= -v_route_penalty + EPS5)
+						fiber_cancel(f);
+				}
+				if (eama_solver_deadline_reached()) {
+					timed_out = true;
+					fiber_cancel(f);
+					break;
+				}
+				fiber_call(f);
+				if (eama_solver_deadline_reached()) {
+					timed_out = true;
+					if (!fiber_is_dead(f))
+						fiber_cancel(f);
+					break;
+				}
 			}
-			fiber_call(f);
-		}
+			if (timed_out) {
+				if (options.log_level == LOGLEVEL_VERBOSE)
+					debug_print("failed", RED);
+				solution_move(s, s_dup);
+				return -1;
+			}
 
-		if (options.log_level == LOGLEVEL_VERBOSE)
-			debug_print(tt_sprintf("opt modification delta: %f", opt_delta), RESET);
-		if (opt_delta > -EPS5) {
 			if (options.log_level == LOGLEVEL_VERBOSE)
-				debug_print("failed", RED);
+				debug_print(tt_sprintf("opt modification delta: %f", opt_delta), RESET);
+			if (opt_delta > -EPS5) {
+				if (options.log_level == LOGLEVEL_VERBOSE)
+					debug_print("failed", RED);
 
-			if (options.beta_correction) {
-				double c_penalty = solution_penalty(s, 1., 0.);
-				double tw_penalty = solution_penalty(s, 0., 1.);
+				if (options.beta_correction) {
+					double c_penalty = solution_penalty(s, 1., 0.);
+					double tw_penalty = solution_penalty(s, 0., 1.);
 				if (c_penalty + EPS5 < tw_penalty)
 					eama_solver.beta /= 0.99;
 				else if (c_penalty > tw_penalty + EPS5)
@@ -196,6 +219,8 @@ perturb(struct solution *s)
 	int n_modifications = 0;
 	/* TODO: reduce the number of unsuccessful iterations */
 	for (int i = 0; i < options.i_rand; i++) {
+		if ((i & 63) == 0 && eama_solver_deadline_reached())
+			return;
 		struct customer *v = solution_find_customer_by_id(s,
 			randint(1, p.n_customers - 1));
 		if (is_ejected(v))
@@ -240,10 +265,14 @@ insert_eject(struct solution *s)
 	int opt_ejection_size = 0;
 
 	for (int i = 0; i < s->n_routes; i++) {
+		if (eama_solver_deadline_reached())
+			goto fail;
 		struct route *v_route = s->routes[i];
 		struct customer *v;
 		/* iterate over all possible insert positions in v_route */
 		for (int j = 1; j < v_route->size; j++) {
+			if (eama_solver_deadline_reached())
+				goto fail;
 			v = v_route->customers[j];
 			struct modification m = modification_new(INSERT, v, s->w);
 			if (!modification_applicable(m))
@@ -257,6 +286,7 @@ insert_eject(struct solution *s)
 			 * that minimizes the sum p of the ejected customers
 			 */
 			struct fiber *f = fiber_new(feasible_ejections_f);
+			bool timed_out = false;
 			fiber_start(f, v_route, options.k_max, eama_solver.p,
 				    ejection, &ejection_size, &p_best);
 			while(!fiber_is_dead(f)) {
@@ -264,8 +294,21 @@ insert_eject(struct solution *s)
 				for (int j = 0; j < ejection_size; j++)
 					opt_ejection[j] = ejection[j];
 				opt_ejection_size = ejection_size;
+				if (eama_solver_deadline_reached()) {
+					timed_out = true;
+					fiber_cancel(f);
+					break;
+				}
 				fiber_call(f);
+				if (eama_solver_deadline_reached()) {
+					timed_out = true;
+					if (!fiber_is_dead(f))
+						fiber_cancel(f);
+					break;
+				}
 			}
+			if (timed_out)
+				goto fail;
 			/* roll insertion back */
 			m = modification_new(EJECT, s->w, NULL);
 			assert(modification_applicable(m));
@@ -312,10 +355,16 @@ insert_eject(struct solution *s)
 	assert(solution_feasible(s));
 	solution_check_missed_customers(s);
 	return 0;
+
+/* cleanup-goto pattern (cf. Linux kernel style): all error paths
+ * jump here to restore the duplicated solution before returning. */
+fail:
+	solution_move(s, s_dup);
+	return -1;
 }
 
 int
-delete_route(struct solution *s, clock_t deadline)
+delete_route(struct solution *s)
 {
 	if (options.log_level == LOGLEVEL_VERBOSE)
 		debug_print("started", RESET);
@@ -329,8 +378,7 @@ delete_route(struct solution *s, clock_t deadline)
 	solution_check_missed_customers(s);
 
 	while (!rlist_empty(&s->ejection_pool)) {
-		/** This will only be executed once during the entire execution time */
-		if (unlikely(clock() >= deadline))
+		if (eama_solver_deadline_reached())
 			goto fail;
 
 		if (options.log_level == LOGLEVEL_VERBOSE) {
@@ -346,14 +394,24 @@ delete_route(struct solution *s, clock_t deadline)
 
 		assert(solution_find_customer_by_id(s, s->w->id) == s->w);
 
+		/* Try reinsertion methods in order: feasible > squeeze > eject.
+		 * Each sub-function polls the deadline internally and returns
+		 * -1 on timeout, so we only need to recheck after a successful
+		 * call (before continuing the loop with possibly stale time). */
 		solution_check_missed_customers(s);
 		if (insert_feasible(s) == 0) {
-			solution_check_missed_customers(s);
-			continue;
-		} else if (squeeze(s) == 0) {
+			if (eama_solver_deadline_reached())
+				goto fail;
 			solution_check_missed_customers(s);
 			continue;
 		}
+		if (squeeze(s) == 0) {
+			if (eama_solver_deadline_reached())
+				goto fail;
+			solution_check_missed_customers(s);
+			continue;
+		}
+
 		assert(solution_find_customer_by_id(s, s->w->id) == s->w);
 		++eama_solver.p[s->w->id];
 		if (options.log_level == LOGLEVEL_VERBOSE)
@@ -362,18 +420,25 @@ delete_route(struct solution *s, clock_t deadline)
 		if (insert_eject(s) == 0) {
 			solution_check_missed_customers(s);
 			perturb(s);
+			if (eama_solver_deadline_reached())
+				goto fail;
 			continue;
 		}
-	fail:
-		if (options.log_level == LOGLEVEL_VERBOSE)
-			debug_print("failed", RED);
-		solution_move(s, s_dup);
-		return -1;
+		/* All three methods failed — give up on this route deletion. */
+		goto fail;
 	}
 	if (options.log_level == LOGLEVEL_VERBOSE)
 		debug_print("completed successfully", GREEN);
 	solution_delete(s_dup);
 	return 0;
+
+/* cleanup-goto pattern (cf. Linux kernel style): all error paths
+ * jump here to restore the duplicated solution before returning. */
+fail:
+	if (options.log_level == LOGLEVEL_VERBOSE)
+		debug_print("failed", RED);
+	solution_move(s, s_dup);
+	return -1;
 }
 
 struct solution *
@@ -387,12 +452,11 @@ eama_solver_solve(void)
 
 	/* Compute deadline with sub-second precision when --t_max_ms is used */
 	clock_t start_clock = clock();
-	clock_t deadline;
 	if (options.has_t_max_ms)
-		deadline = start_clock +
-			   (clock_t)((double)options.t_max_ms / 1000.0 * CLOCKS_PER_SEC);
+		eama_solver.deadline = start_clock +
+				      (clock_t)((double)options.t_max_ms / 1000.0 * CLOCKS_PER_SEC);
 	else
-		deadline = start_clock + CLOCKS_PER_SEC * options.t_max;
+		eama_solver.deadline = start_clock + CLOCKS_PER_SEC * options.t_max;
 
 	int lower_bound = MAX(problem_routes_straight_lower_bound(),
 			      options.lower_bound);
@@ -411,7 +475,7 @@ eama_solver_solve(void)
 	while (s->n_routes > lower_bound) {
 		if (options.log_level >= LOGLEVEL_NORMAL)
 			debug_print(tt_sprintf("routes number: %d", s->n_routes), PURPLE);
-		if (delete_route(s, deadline) != 0)
+		if (delete_route(s) != 0)
 			break;
 		assert(rlist_empty(&s->ejection_pool));
 		assert(s->w == NULL);
